@@ -136,8 +136,8 @@ class FargateSpawnerEC2InstanceProfileAuthentication(FargateSpawnerAuthenticatio
 class FargateSpawnerEC2InstanceProfileAuthenticationV2(FargateSpawnerAuthentication):
     """
     EC2 Instance Profile Authentication implementation that uses IMDSv2.
-    This class retrieves AWS credentials from the EC2 instance metadata service using IMDSv2's
-    token-based authentication.
+    Supports both direct EC2 instance usage and containerized environments through
+    environment variables.
     """
 
     aws_access_key_id = Unicode()
@@ -148,31 +148,50 @@ class FargateSpawnerEC2InstanceProfileAuthenticationV2(FargateSpawnerAuthenticat
     token_expiration = Datetime()
     token = Unicode()
     token_ttl_seconds = Int(21600)  # 6 hours by default
+    env_token_key = Unicode('IMDSV2_TOKEN', config=True)  # Allow configuration of env var name
     
     async def _get_imds_token(self):
-        """Get IMDSv2 token required for metadata requests"""
+        """
+        Get IMDSv2 token either from environment variable or by making an API request.
+        Returns the token as a string.
+        """
         now = datetime.datetime.now()
         
-        # Only get a new token if we don't have one or if it's expired
+        # First check if token is provided via environment variable
+        env_token = os.environ.get(self.env_token_key)
+        if env_token:
+            self.log.debug(f"Using IMDSv2 token from environment variable {self.env_token_key}")
+            if not self.token:  # Only set expiration on first use
+                self.token = env_token
+                self.token_expiration = now + datetime.timedelta(seconds=self.token_ttl_seconds)
+            return env_token
+            
+        # If no environment token, proceed with API request
         if not self.token or now > self.token_expiration:
-            request = HTTPRequest(
-                'http://169.254.169.254/latest/api/token', 
-                method='PUT',
-                headers={
-                    'X-aws-ec2-metadata-token-ttl-seconds': str(self.token_ttl_seconds)
-                }
-            )
-            self.token = (await AsyncHTTPClient().fetch(request)).body.decode('utf-8')
-            self.token_expiration = now + datetime.timedelta(seconds=self.token_ttl_seconds)
+            self.log.debug("Fetching new IMDSv2 token from metadata service")
+            try:
+                request = HTTPRequest(
+                    'http://169.254.169.254/latest/api/token', 
+                    method='PUT',
+                    headers={
+                        'X-aws-ec2-metadata-token-ttl-seconds': str(self.token_ttl_seconds)
+                    }
+                )
+                self.token = (await AsyncHTTPClient().fetch(request)).body.decode('utf-8')
+                self.token_expiration = now + datetime.timedelta(seconds=self.token_ttl_seconds)
+            except Exception as e:
+                self.log.error(f"Failed to fetch IMDSv2 token: {str(e)}")
+                raise
         
         return self.token
 
     async def get_credentials(self):
+        """Get AWS credentials using the IMDSv2 token"""
         now = datetime.datetime.now()
 
         if now > self.expiration:
             try:
-                # Get IMDSv2 token first
+                # Get IMDSv2 token first (either from env or metadata service)
                 token = await self._get_imds_token()
                 imds_headers = {'X-aws-ec2-metadata-token': token}
                 
