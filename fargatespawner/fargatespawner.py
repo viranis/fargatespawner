@@ -133,6 +133,82 @@ class FargateSpawnerEC2InstanceProfileAuthentication(FargateSpawnerAuthenticatio
             pre_auth_headers=self.pre_auth_headers,
         )
 
+class FargateSpawnerEC2InstanceProfileAuthenticationV2(FargateSpawnerAuthentication):
+    """
+    EC2 Instance Profile Authentication implementation that uses IMDSv2.
+    This class retrieves AWS credentials from the EC2 instance metadata service using IMDSv2's
+    token-based authentication.
+    """
+
+    aws_access_key_id = Unicode()
+    aws_secret_access_key = Unicode()
+    pre_auth_headers = Dict()
+    expiration = Datetime()
+    aws_iam_role = Unicode()
+    token_expiration = Datetime()
+    token = Unicode()
+    token_ttl_seconds = Int(21600)  # 6 hours by default
+    
+    async def _get_imds_token(self):
+        """Get IMDSv2 token required for metadata requests"""
+        now = datetime.datetime.now()
+        
+        # Only get a new token if we don't have one or if it's expired
+        if not self.token or now > self.token_expiration:
+            request = HTTPRequest(
+                'http://169.254.169.254/latest/api/token', 
+                method='PUT',
+                headers={
+                    'X-aws-ec2-metadata-token-ttl-seconds': str(self.token_ttl_seconds)
+                }
+            )
+            self.token = (await AsyncHTTPClient().fetch(request)).body.decode('utf-8')
+            self.token_expiration = now + datetime.timedelta(seconds=self.token_ttl_seconds)
+        
+        return self.token
+
+    async def get_credentials(self):
+        now = datetime.datetime.now()
+
+        if now > self.expiration:
+            try:
+                # Get IMDSv2 token first
+                token = await self._get_imds_token()
+                imds_headers = {'X-aws-ec2-metadata-token': token}
+                
+                # Get IAM role name
+                request = HTTPRequest(
+                    'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+                    method='GET',
+                    headers=imds_headers
+                )
+                aws_iam_role = (await AsyncHTTPClient().fetch(request)).body.decode('utf-8')
+                
+                # Get credentials using the role name
+                request = HTTPRequest(
+                    'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + aws_iam_role,
+                    method='GET',
+                    headers=imds_headers
+                )
+                creds = json.loads((await AsyncHTTPClient().fetch(request)).body.decode('utf-8'))
+                
+                self.aws_access_key_id = creds['AccessKeyId']
+                self.aws_secret_access_key = creds['SecretAccessKey']
+                self.pre_auth_headers = {
+                    'x-amz-security-token': creds['Token'],
+                }
+                self.expiration = datetime.datetime.strptime(creds['Expiration'], '%Y-%m-%dT%H:%M:%SZ')
+            
+            except HTTPError as e:
+                self.log.error(f"Error fetching credentials using IMDSv2: {str(e)}")
+                raise
+
+        return AwsCreds(
+            access_key_id=self.aws_access_key_id,
+            secret_access_key=self.aws_secret_access_key,
+            pre_auth_headers=self.pre_auth_headers,
+        )
+
 class FargateSpawner(Spawner):
 
     aws_region = Unicode(config=True)
