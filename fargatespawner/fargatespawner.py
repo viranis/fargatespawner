@@ -134,10 +134,20 @@ class FargateSpawnerEC2InstanceProfileAuthentication(FargateSpawnerAuthenticatio
         )
 
 class FargateSpawnerEC2InstanceProfileAuthenticationV2(FargateSpawnerAuthentication):
-    """
-    EC2 Instance Profile Authentication implementation that uses IMDSv2.
-    Supports both direct EC2 instance usage and containerized environments through
-    environment variables.
+    """EC2 Instance Profile Authentication implementation that uses IMDSv2.
+    
+    This class implements the more secure IMDSv2 (Instance Metadata Service Version 2) 
+    authentication flow for retrieving AWS credentials from an EC2 instance profile.
+    IMDSv2 adds session authentication to instance metadata service requests using
+    a token-based approach.
+
+    The authentication process involves:
+    1. Retrieving a token using a PUT request
+    2. Using that token to get the IAM role name
+    3. Using the token and role name to get the actual credentials
+
+    The credentials are cached until expiration, at which point they are refreshed
+    automatically.
     """
 
     aws_access_key_id = Unicode()
@@ -145,82 +155,52 @@ class FargateSpawnerEC2InstanceProfileAuthenticationV2(FargateSpawnerAuthenticat
     pre_auth_headers = Dict()
     expiration = Datetime()
     aws_iam_role = Unicode()
-    token_expiration = Datetime()
     token = Unicode()
-    token_ttl_seconds = Int(21600)  # 6 hours by default
-    env_token_key = Unicode('IMDSV2_TOKEN', config=True)  # Allow configuration of env var name
-    
-    async def _get_imds_token(self):
-        """
-        Get IMDSv2 token either from environment variable or by making an API request.
-        Returns the token as a string.
-        """
-        now = datetime.datetime.now()
-        
-        # First check if token is provided via environment variable
-        env_token = os.environ.get(self.env_token_key)
-        if env_token:
-            self.log.debug(f"Using IMDSv2 token from environment variable {self.env_token_key}")
-            if not self.token:  # Only set expiration on first use
-                self.token = env_token
-                self.token_expiration = now + datetime.timedelta(seconds=self.token_ttl_seconds)
-            return env_token
-            
-        # If no environment token, proceed with API request
-        if not self.token or now > self.token_expiration:
-            self.log.debug("Fetching new IMDSv2 token from metadata service")
-            try:
-                request = HTTPRequest(
-                    'http://169.254.169.254/latest/api/token', 
-                    method='PUT',
-                    headers={
-                        'X-aws-ec2-metadata-token-ttl-seconds': str(self.token_ttl_seconds)
-                    }
-                )
-                self.token = (await AsyncHTTPClient().fetch(request)).body.decode('utf-8')
-                self.token_expiration = now + datetime.timedelta(seconds=self.token_ttl_seconds)
-            except Exception as e:
-                self.log.error(f"Failed to fetch IMDSv2 token: {str(e)}")
-                raise
-        
-        return self.token
+    token_expiration = Datetime()
+    token_ttl_seconds = Int(21600)  # 6 hours default token validity
 
     async def get_credentials(self):
-        """Get AWS credentials using the IMDSv2 token"""
+        """Retrieve AWS credentials using IMDSv2 authentication.
+        
+        Returns:
+            AwsCreds: Named tuple containing access key, secret key, and session token.
+        """
         now = datetime.datetime.now()
 
         if now > self.expiration:
-            try:
-                # Get IMDSv2 token first (either from env or metadata service)
-                token = await self._get_imds_token()
-                imds_headers = {'X-aws-ec2-metadata-token': token}
-                
-                # Get IAM role name
-                request = HTTPRequest(
-                    'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
-                    method='GET',
-                    headers=imds_headers
-                )
-                aws_iam_role = (await AsyncHTTPClient().fetch(request)).body.decode('utf-8')
-                
-                # Get credentials using the role name
-                request = HTTPRequest(
-                    'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + aws_iam_role,
-                    method='GET',
-                    headers=imds_headers
-                )
-                creds = json.loads((await AsyncHTTPClient().fetch(request)).body.decode('utf-8'))
-                
-                self.aws_access_key_id = creds['AccessKeyId']
-                self.aws_secret_access_key = creds['SecretAccessKey']
-                self.pre_auth_headers = {
-                    'x-amz-security-token': creds['Token'],
-                }
-                self.expiration = datetime.datetime.strptime(creds['Expiration'], '%Y-%m-%dT%H:%M:%SZ')
+            # Step 1: Get IMDSv2 session token
+            # Token is required for all subsequent metadata service requests
+            request = HTTPRequest(
+                'http://169.254.169.254/latest/api/token',
+                method='PUT',
+                headers={'X-aws-ec2-metadata-token-ttl-seconds': str(self.token_ttl_seconds)},
+                body=''  # Empty body required for PUT request
+            )
+            token = (await AsyncHTTPClient().fetch(request)).body.decode('utf-8')
             
-            except HTTPError as e:
-                self.log.error(f"Error fetching credentials using IMDSv2: {str(e)}")
-                raise
+            # Step 2: Get IAM role name attached to the instance
+            request = HTTPRequest(
+                'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+                method='GET',
+                headers={'X-aws-ec2-metadata-token': token}
+            )
+            aws_iam_role = (await AsyncHTTPClient().fetch(request)).body.decode('utf-8')
+            
+            # Step 3: Get credentials for the role
+            request = HTTPRequest(
+                f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{aws_iam_role}',
+                method='GET',
+                headers={'X-aws-ec2-metadata-token': token}
+            )
+            creds = json.loads((await AsyncHTTPClient().fetch(request)).body.decode('utf-8'))
+            
+            # Store credentials and session token
+            self.aws_access_key_id = creds['AccessKeyId']
+            self.aws_secret_access_key = creds['SecretAccessKey']
+            self.pre_auth_headers = {
+                'x-amz-security-token': creds['Token'],
+            }
+            self.expiration = datetime.datetime.strptime(creds['Expiration'], '%Y-%m-%dT%H:%M:%SZ')
 
         return AwsCreds(
             access_key_id=self.aws_access_key_id,
